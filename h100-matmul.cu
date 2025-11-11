@@ -12,6 +12,54 @@
 
 typedef __nv_bfloat16 bf16;
 
+// Ref
+namespace Ref {
+    // THIS CODE WAS TAKEN FROM https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
+    // WILL BE REPLACED BY MY OWN CODE AFTER ASKING ABOUT PTX INSTRUCTIONS IN OFFICE HOURS
+
+template<int WGMMA_N>
+__device__ inline void wgmma_m64nNk16(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
+    static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
+    if  constexpr (WGMMA_N == 256)
+        wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
+    if  constexpr (WGMMA_N == 192)
+        wgmma192<1, 1, 1, 0, 0>(d, sA, sB);
+    if  constexpr (WGMMA_N == 128)
+        wgmma128<1, 1, 1, 0, 0>(d, sA, sB);
+    if constexpr (WGMMA_N == 64)
+        wgmma64<1, 1, 1, 0, 0>(d, sA, sB);
+    if constexpr (WGMMA_N == 32)
+        wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
+}
+
+template<int WGMMA_N>
+__device__ inline void store_wgmma_m64nNk16 (float d[WGMMA_N/16][8], int tid, bf16* block_C, int M) {
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    uint32_t row = warp*16 + lane/4;
+
+    #define CIDX(i,j) (( (j) )*M + ( (i) ))
+    #pragma unroll
+    for (int w = 0; w < WGMMA_N/16; ++w) {
+        int col = 16*w + 2*(tid & 3);
+
+        block_C[CIDX(row,     col    )] = __float2bfloat16(d[w][0]);
+        block_C[CIDX(row,     col + 1)] = __float2bfloat16(d[w][1]);
+        block_C[CIDX(row + 8, col    )] = __float2bfloat16(d[w][2]);
+        block_C[CIDX(row + 8, col + 1)] = __float2bfloat16(d[w][3]);
+
+        block_C[CIDX(row,     col + 8)] = __float2bfloat16(d[w][4]);
+        block_C[CIDX(row,     col + 9)] = __float2bfloat16(d[w][5]);
+        block_C[CIDX(row + 8, col + 8)] = __float2bfloat16(d[w][6]);
+        block_C[CIDX(row + 8, col + 9)] = __float2bfloat16(d[w][7]);
+    }
+    #undef CIDX
+}
+
+}
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
@@ -33,18 +81,22 @@ void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint3
         boxDim,                   // const cuuint32_t *boxDim,
         elementStrides,                // const cuuint32_t *elementStrides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
 }
 
 
-// ROW MAJOR
-#define IDX(i, j, cols) ((i) * (cols) + (j))
-constexpr int TILE_N = 64;
+// TUNABLE
 constexpr int TILE_M = 64;
+constexpr int TILE_N = 128;
 constexpr int TILE_K = 64;
+constexpr int WGMMA_N= 128;
+
+// CONSTS
+constexpr int WGMMA_M= 64;
+constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128;
 
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
@@ -52,9 +104,9 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
     __shared__ alignas(8)  uint64_t A_barrier;
     __shared__ alignas(8)  uint64_t B_barrier;
 
-    __shared__ alignas(128) bf16  sA[TILE_M][TILE_K];
-    __shared__ alignas(128) bf16  sB[TILE_N][TILE_K];
-    __shared__ alignas(128) float sC[TILE_N][TILE_M];
+    __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
+    __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
+    float rC [WGMMA_N/16][8] = {0.0f};
 
     int GlobalI = blockIdx.y * TILE_N;
     int GlobalJ = blockIdx.x * TILE_M;
@@ -67,13 +119,9 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
     }
     __syncthreads();
 
-    for (int i = 0 ; i < TILE_N ; i ++ ) {
-        for (int j = 0 ; j < TILE_M ; j ++ ) {
-            sC [i][j] = __bfloat162float (0.0f);
-        }
-    }
 
-    int cur_phase = 0;
+    int A_cur_phase = 0;
+    int B_cur_phase = 0;
     for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
         // load A    
         if ( thIdx == 0 ) {
@@ -106,38 +154,24 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
             arrive (&B_barrier, 1);
         }
 
-        wait (&A_barrier, cur_phase);
-        wait (&B_barrier, cur_phase); 
+        wait (&A_barrier, A_cur_phase);
+        wait (&B_barrier, B_cur_phase); 
         __syncthreads();
-        cur_phase ^= 1 ;
+        A_cur_phase ^= 1 ;
+        B_cur_phase ^= 1 ;
 
         // Matmul
-        if ( thIdx == 0 ) {
-            for (int i = 0 ; i < TILE_N ; i ++ ) {
-                for (int j = 0 ; j < TILE_M ; j ++ ) {
-                    float sum = 0.0f;
-                    for (int k = 0 ; k < TILE_K ; k ++ ) {
-                        float a = __bfloat162float (sA [j][k]);
-                        float b = __bfloat162float (sB [i][k]);
-                        sum += a * b ;
-                    }
-                    sC [i][j] += sum;
-                }
-            }
+        warpgroup_arrive();
+        #pragma unroll
+        for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
+            Ref::wgmma_m64nNk16<WGMMA_N>(rC, &sA[LocalK], &sB[LocalK]);
         }
-        __syncthreads();
+        wgmma_commit();
+        wgmma_wait<0>();
     }
 
     // Store 
-    if ( thIdx == 0 ) {
-        for (int i = 0 ; i < TILE_N ; i ++ ) {
-            for (int j = 0 ; j < TILE_M ; j ++ ) {
-                int gI = GlobalI + i ;
-                int gJ = GlobalJ + j ;
-                C [IDX(gI,gJ,M)] = __float2bfloat16 (sC [i][j]);
-            }
-        }
-    }
+    Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC, thIdx, C + GlobalI*M + GlobalJ, M);
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
@@ -241,7 +275,7 @@ bool check_correctness(bf16 *ref, bf16 *test, int N, float tolerance = 0.1f) {
 
 int main() {
 
-    const int M = 4096, N = 4096, K = 4096;
+    const int M = 8192, N = 8192, K = 8192;
 
     bf16 *A = (bf16 *)malloc(sizeof(bf16) * M * K);
     bf16 *B = (bf16 *)malloc(sizeof(bf16) * K * N);
