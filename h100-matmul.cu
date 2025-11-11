@@ -16,7 +16,7 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
-void get_tensor_map (CUtensorMap* src_map, bf16* src, int globalRows, int globalCols, int sharedRows, int sharedCols) {
+void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint32_t globalCols, uint32_t sharedRows, uint32_t sharedCols) {
     void* globalAddress = src;
     constexpr uint32_t tensorRank = 2;
     uint64_t globalDim[tensorRank] = {globalCols, globalRows};
