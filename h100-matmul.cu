@@ -16,17 +16,92 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
+// for (int i = 0 ; i < N ; i ++ ) {
+//     for (int j = 0 ; j < M ; j ++ ) {
+//         float sum = 0.0f;
+//         for (int k = 0 ; k < K ; k ++ ) {
+//             float a = __bfloat162float (A [IDX(j,k,K)]) ;
+//             float b = __bfloat162float (B [IDX(i,k,K)]) ;
+//             sum += a * b ; 
+//         }
+//         C [IDX(i,j,M)] = __float2bfloat16 (sum) ; 
+//     }
+// }
 
-__global__ void h100_matmul() {
+// ROW MAJOR
+#define IDX(i, j, cols) ((i) * (cols) + (j))
+constexpr int TILE_N = 64;
+constexpr int TILE_M = 64;
+constexpr int TILE_K = 64;
 
-    // <--- your code here --->
+__global__ void h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+    __shared__ alignas(128) bf16  sA[TILE_M][TILE_K];
+    __shared__ alignas(128) bf16  sB[TILE_N][TILE_K];
+    __shared__ alignas(128) float sC[TILE_N][TILE_M];
 
+    int GlobalI = blockIdx.y * TILE_N;
+    int GlobalJ = blockIdx.x * TILE_M;
+    
+    for (int i = 0 ; i < TILE_N ; i ++ ) {
+        for (int j = 0 ; j < TILE_M ; j ++ ) {
+            sC [i][j] = __bfloat162float (0.0f);
+        }
+    }
+
+    for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
+        // load A
+        for (int i = 0 ; i < TILE_M ; i ++ ) {
+            for (int j = 0 ; j < TILE_K ; j ++ ) {
+                int gI = GlobalJ + i ;
+                int gJ = GlobalK + j ;
+                sA [i][j] = A [IDX(gI,gJ,K)];
+            }
+        }        
+
+        // load B
+        for (int i = 0 ; i < TILE_N ; i ++ ) {
+            for (int j = 0 ; j < TILE_K ; j ++ ) {
+                int gI = GlobalI + i ;
+                int gJ = GlobalK + j ;
+                sB [i][j] = B [IDX(gI,gJ,K)];
+            }
+        }
+
+        __syncthreads();
+
+        // Matmul
+        
+        for (int i = 0 ; i < TILE_N ; i ++ ) {
+            for (int j = 0 ; j < TILE_M ; j ++ ) {
+                float sum = 0.0f;
+                for (int k = 0 ; k < TILE_K ; k ++ ) {
+                    float a = __bfloat162float (sA [j][k]);
+                    float b = __bfloat162float (sB [i][k]);
+                    sum += a * b ;
+                }
+                sC [i][j] += sum;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Store 
+    for (int i = 0 ; i < TILE_N ; i ++ ) {
+        for (int j = 0 ; j < TILE_M ; j ++ ) {
+            int gI = GlobalI + i ;
+            int gJ = GlobalJ + j ;
+            C [IDX(gI,gJ,M)] = __float2bfloat16 (sC [i][j]);
+        }
+    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
     // <--- your code here --->
-
+    dim3 block (1, 1, 1) ;
+    dim3 grid  ((M + TILE_M - 1 )/TILE_M,(N + TILE_N - 1 )/TILE_N, 1) ;
+    h100_matmul <<<grid,block>>>(M,N,K,A,B,C);
 }
 
 /// <--- your code here --->
@@ -117,7 +192,7 @@ bool check_correctness(bf16 *ref, bf16 *test, int N, float tolerance = 0.1f) {
 
 int main() {
 
-    const int M = 8192, N = 8192, K = 8192;
+    const int M = 4096, N = 4096, K = 4096;
 
     bf16 *A = (bf16 *)malloc(sizeof(bf16) * M * K);
     bf16 *B = (bf16 *)malloc(sizeof(bf16) * K * N);
