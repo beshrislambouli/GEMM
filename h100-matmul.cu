@@ -16,18 +16,6 @@ typedef __nv_bfloat16 bf16;
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
-// for (int i = 0 ; i < N ; i ++ ) {
-//     for (int j = 0 ; j < M ; j ++ ) {
-//         float sum = 0.0f;
-//         for (int k = 0 ; k < K ; k ++ ) {
-//             float a = __bfloat162float (A [IDX(j,k,K)]) ;
-//             float b = __bfloat162float (B [IDX(i,k,K)]) ;
-//             sum += a * b ; 
-//         }
-//         C [IDX(i,j,M)] = __float2bfloat16 (sum) ; 
-//     }
-// }
-
 void get_tensor_map (CUtensorMap* src_map, bf16* src, int globalRows, int globalCols, int sharedRows, int sharedCols) {
     void* globalAddress = src;
     constexpr uint32_t tensorRank = 2;
@@ -57,6 +45,7 @@ void get_tensor_map (CUtensorMap* src_map, bf16* src, int globalRows, int global
 constexpr int TILE_N = 64;
 constexpr int TILE_M = 64;
 constexpr int TILE_K = 64;
+constexpr int NUM_THREADS = 128;
 
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
@@ -69,10 +58,15 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
 
     int GlobalI = blockIdx.y * TILE_N;
     int GlobalJ = blockIdx.x * TILE_M;
+    int thIdx = threadIdx.x;
 
-    init_barrier (&A_barrier, 1);
-    init_barrier (&B_barrier, 1);
-    async_proxy_fence ();
+    if ( thIdx == 0 ) {
+        init_barrier (&A_barrier, NUM_THREADS);
+        init_barrier (&B_barrier, NUM_THREADS);
+        async_proxy_fence ();
+    }
+    __syncthreads();
+
     for (int i = 0 ; i < TILE_N ; i ++ ) {
         for (int j = 0 ; j < TILE_M ; j ++ ) {
             sC [i][j] = __bfloat162float (0.0f);
@@ -81,45 +75,36 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
 
     int cur_phase = 0;
     for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
-        // load A
-        // for (int i = 0 ; i < TILE_M ; i ++ ) {
-        //     for (int j = 0 ; j < TILE_K ; j ++ ) {
-        //         int gI = GlobalJ + i ;
-        //         int gJ = GlobalK + j ;
-        //         sA [i][j] = A [IDX(gI,gJ,K)];
-        //     }
-        // }       
-        cp_async_bulk_tensor_2d_global_to_shared (
-            sA,
-            &A_map,
-            GlobalK,
-            GlobalJ,
-            &A_barrier
-        );
-        expect_bytes_and_arrive (
-            &A_barrier,
-            TILE_M*TILE_K*sizeof(bf16)
-        );
+        // load A    
+        if ( thIdx == 0 ) {
+            cp_async_bulk_tensor_2d_global_to_shared (
+                sA,
+                &A_map,
+                GlobalK,
+                GlobalJ,
+                &A_barrier
+            );
+            expect_bytes_and_arrive (
+                &A_barrier,
+                TILE_M*TILE_K*sizeof(bf16)
+            );
 
-        // load B
-        // for (int i = 0 ; i < TILE_N ; i ++ ) {
-        //     for (int j = 0 ; j < TILE_K ; j ++ ) {
-        //         int gI = GlobalI + i ;
-        //         int gJ = GlobalK + j ;
-        //         sB [i][j] = B [IDX(gI,gJ,K)];
-        //     }
-        // }
-        cp_async_bulk_tensor_2d_global_to_shared (
-            sB,
-            &B_map,
-            GlobalK,
-            GlobalI,
-            &B_barrier
-        );
-        expect_bytes_and_arrive (
-            &B_barrier,
-            TILE_N*TILE_K*sizeof(bf16)
-        );
+            // load B
+            cp_async_bulk_tensor_2d_global_to_shared (
+                sB,
+                &B_map,
+                GlobalK,
+                GlobalI,
+                &B_barrier
+            );
+            expect_bytes_and_arrive (
+                &B_barrier,
+                TILE_N*TILE_K*sizeof(bf16)
+            );
+        } else {
+            arrive (&A_barrier, 1);
+            arrive (&B_barrier, 1);
+        }
 
         wait (&A_barrier, cur_phase);
         wait (&B_barrier, cur_phase); 
@@ -127,28 +112,30 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
         cur_phase ^= 1 ;
 
         // Matmul
-        
-        for (int i = 0 ; i < TILE_N ; i ++ ) {
-            for (int j = 0 ; j < TILE_M ; j ++ ) {
-                float sum = 0.0f;
-                for (int k = 0 ; k < TILE_K ; k ++ ) {
-                    float a = __bfloat162float (sA [j][k]);
-                    float b = __bfloat162float (sB [i][k]);
-                    sum += a * b ;
+        if ( thIdx == 0 ) {
+            for (int i = 0 ; i < TILE_N ; i ++ ) {
+                for (int j = 0 ; j < TILE_M ; j ++ ) {
+                    float sum = 0.0f;
+                    for (int k = 0 ; k < TILE_K ; k ++ ) {
+                        float a = __bfloat162float (sA [j][k]);
+                        float b = __bfloat162float (sB [i][k]);
+                        sum += a * b ;
+                    }
+                    sC [i][j] += sum;
                 }
-                sC [i][j] += sum;
             }
         }
-
         __syncthreads();
     }
 
     // Store 
-    for (int i = 0 ; i < TILE_N ; i ++ ) {
-        for (int j = 0 ; j < TILE_M ; j ++ ) {
-            int gI = GlobalI + i ;
-            int gJ = GlobalJ + j ;
-            C [IDX(gI,gJ,M)] = __float2bfloat16 (sC [i][j]);
+    if ( thIdx == 0 ) {
+        for (int i = 0 ; i < TILE_N ; i ++ ) {
+            for (int j = 0 ; j < TILE_M ; j ++ ) {
+                int gI = GlobalI + i ;
+                int gJ = GlobalJ + j ;
+                C [IDX(gI,gJ,M)] = __float2bfloat16 (sC [i][j]);
+            }
         }
     }
 }
@@ -161,7 +148,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
     CUtensorMap B_map{};
     get_tensor_map (&B_map, B, N, K, TILE_N, TILE_K);
 
-    dim3 block (1, 1, 1) ;
+    dim3 block (NUM_THREADS, 1, 1) ;
     dim3 grid  ((M + TILE_M - 1 )/TILE_M,(N + TILE_N - 1 )/TILE_N, 1) ;
     h100_matmul <<<grid,block>>>(M,N,K,A_map,B_map,C);
 }
