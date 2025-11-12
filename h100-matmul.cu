@@ -9,6 +9,22 @@
 #include <vector>
 #include "tma-interface.cuh"
 #include "wgmma-interface.cuh"
+#include <cuda.h>
+#include <cudaTypedefs.h>
+#include <cuda/barrier>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <ctime>
+#include <iostream>
+#include <vector>
+#include <random>
+#include <cuda_bf16.h>
+#include <cassert>
+#include <unistd.h>
 
 typedef __nv_bfloat16 bf16;
 
@@ -93,6 +109,7 @@ constexpr int TILE_M = 128;
 constexpr int TILE_N = 128;
 constexpr int TILE_K = 64;
 constexpr int WGMMA_N= 128;
+constexpr int QUEUE = 1;
 
 // CONSTS
 constexpr int WGMMA_M= 64;
@@ -101,12 +118,28 @@ constexpr int NUM_THREADS = 128;
 constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
 constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
 
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
+
+struct SMem {
+    alignas(128) bf16 A[TILE_M*TILE_K*QUEUE];
+    alignas(128) bf16 B[TILE_N*TILE_K*QUEUE];
+};
+
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
-    __shared__ alignas(8)  uint64_t Barrier;
+    // __shared__ alignas(8)  uint64_t Barrier;
+    
 
-    __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
-    __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
+    extern __shared__ __align__(128) uint8_t smem[];
+    SMem &s = *reinterpret_cast<SMem*>(smem);
+    bf16 *sA = s.A;
+    bf16 *sB = s.B;
+    // __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
+    // __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
+
+    __shared__ barrier Barrier;
+
     float rC [WGMMA_PER_N][WGMMA_PER_M][WGMMA_N/16][8] = {0.0f};
 
     int GlobalI = blockIdx.y * TILE_N;
@@ -114,42 +147,47 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
     int thIdx = threadIdx.x;
 
     if ( thIdx == 0 ) {
-        init_barrier (&Barrier, NUM_THREADS);
+        // init_barrier (&Barrier, NUM_THREADS);
+        init (&Barrier, NUM_THREADS);
         async_proxy_fence ();
     }
     __syncthreads();
 
 
-    int Cur_phase = 0;
+    barrier::arrival_token token;
     for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
         if ( thIdx == 0 ) {
-            cp_async_bulk_tensor_2d_global_to_shared (
+            cde::cp_async_bulk_tensor_2d_global_to_shared (
                 sA,
                 &A_map,
                 GlobalK,
                 GlobalJ,
-                &Barrier
+                Barrier
             );
 
-            cp_async_bulk_tensor_2d_global_to_shared (
+            cde::cp_async_bulk_tensor_2d_global_to_shared (
                 sB,
                 &B_map,
                 GlobalK,
                 GlobalI,
-                &Barrier
+                Barrier
             );
 
-            expect_bytes_and_arrive (
-                &Barrier,
+            token = cuda::device::barrier_arrive_tx (
+                Barrier,
+                1,
                 TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
             );
 
         } else {
-            arrive (&Barrier, 1);
+            // arrive (&Barrier, 1);
+            token = Barrier.arrive();
         }
 
-        wait (&Barrier, Cur_phase);
-        Cur_phase ^= 1 ;
+        Barrier.wait(std::move(token));
+        __syncthreads();
+        // wait (&Barrier, Cur_phase);
+        // Cur_phase ^= 1 ;
 
         // Matmul
         warpgroup_arrive();
@@ -189,7 +227,17 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
     dim3 block (NUM_THREADS, 1, 1) ;
     dim3 grid  ((M + TILE_M - 1 )/TILE_M,(N + TILE_N - 1 )/TILE_N, 1) ;
-    h100_matmul <<<grid,block>>>(M,N,K,A_map,B_map,C);
+
+    size_t smem_bytes = sizeof(SMem);
+    CUDA_CHECK (
+        cudaFuncSetAttribute (
+            h100_matmul,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 
+            smem_bytes
+        )
+    );
+
+    h100_matmul <<<grid, block, smem_bytes>>>(M,N,K,A_map,B_map,C);
 }
 
 /// <--- your code here --->
