@@ -109,15 +109,17 @@ constexpr int TILE_M = 128;
 constexpr int TILE_N = 128;
 constexpr int TILE_K = 64;
 constexpr int WGMMA_N= 128;
-constexpr int QUEUE = 1;
+constexpr int QUEUE = 4;
+constexpr int WG = 2 ;
 
 // CONSTS
 constexpr int WGMMA_M= 64;
 constexpr int WGMMA_K= 16;
-constexpr int NUM_THREADS = 128;
+constexpr int NUM_THREADS = 128 * WG;
 constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
 constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
 
+constexpr int WGMMA_I = 0;
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
@@ -126,7 +128,7 @@ struct SMem {
     alignas(128) bf16 B[TILE_N*TILE_K*QUEUE];
 };
 
-__global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
+__global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
     // __shared__ alignas(8)  uint64_t Barrier;
     
@@ -138,83 +140,108 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
     // __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
     // __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
 
-    __shared__ barrier Barrier;
+    __shared__ barrier Full  [QUEUE];
+    __shared__ barrier Empty [QUEUE];
 
     float rC [WGMMA_PER_N][WGMMA_PER_M][WGMMA_N/16][8] = {0.0f};
 
     int GlobalI = blockIdx.y * TILE_N;
     int GlobalJ = blockIdx.x * TILE_M;
-    int thIdx = threadIdx.x;
+    int thIdx = threadIdx.x % 128;
+    int wgIdx = threadIdx.x / 128;
 
     if ( thIdx == 0 ) {
         // init_barrier (&Barrier, NUM_THREADS);
-        init (&Barrier, NUM_THREADS);
+        // init (&Barrier, NUM_THREADS);
+        for (int i = 0 ; i < QUEUE ; i ++ ) {
+            init (&Full  [i], 128 + 1 );
+            init (&Empty [i], 128 + 1 );
+        }
         async_proxy_fence ();
     }
     __syncthreads();
 
 
-    barrier::arrival_token token;
-    for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
+    if ( wgIdx == 0 ) {
+        
         if ( thIdx == 0 ) {
-            cde::cp_async_bulk_tensor_2d_global_to_shared (
-                sA,
-                &A_map,
-                GlobalK,
-                GlobalJ,
-                Barrier
-            );
-
-            cde::cp_async_bulk_tensor_2d_global_to_shared (
-                sB,
-                &B_map,
-                GlobalK,
-                GlobalI,
-                Barrier
-            );
-
-            token = cuda::device::barrier_arrive_tx (
-                Barrier,
-                1,
-                TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
-            );
-
-        } else {
-            // arrive (&Barrier, 1);
-            token = Barrier.arrive();
-        }
-
-        Barrier.wait(std::move(token));
-        __syncthreads();
-        // wait (&Barrier, Cur_phase);
-        // Cur_phase ^= 1 ;
-
-        // Matmul
-        warpgroup_arrive();
-        for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
-            for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
-
-                bf16* CursA = sA + WGMMA_J * (TILE_K * WGMMA_M);
-                bf16* CursB = sB + WGMMA_I * (TILE_K * WGMMA_N);
-
-                #pragma unroll
-                for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
-                    Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J], &CursA[LocalK], &CursB[LocalK]);
+            int Crnt_Q_It = 0 ;
+            for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
+                if (Crnt_Q_It == QUEUE) {
+                    Crnt_Q_It = 0 ;
                 }
+                Empty [Crnt_Q_It] .wait ( Empty [Crnt_Q_It] .arrive() );
+                cde::cp_async_bulk_tensor_2d_global_to_shared (
+                    &sA [ Crnt_Q_It * TILE_M*TILE_K],
+                    &A_map,
+                    GlobalK,
+                    GlobalJ,
+                    Full [Crnt_Q_It]
+                );
+
+                cde::cp_async_bulk_tensor_2d_global_to_shared (
+                    &sB [ Crnt_Q_It * TILE_N*TILE_K],
+                    &B_map,
+                    GlobalK,
+                    GlobalI,
+                    Full [Crnt_Q_It]
+                );
+
+                barrier::arrival_token _ = cuda::device::barrier_arrive_tx (
+                    Full [Crnt_Q_It],
+                    1,
+                    TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
+                );
+
             }
+            
         }
-        wgmma_commit();
-        wgmma_wait<0>();
+
+    } else {
+
+        for (int i = 0 ; i < QUEUE ; i ++ ) {
+            barrier::arrival_token _ = Empty [i] .arrive();
+        }
+
+        int Crnt_Q_It = 0 ;
+        for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
+            if ( Crnt_Q_It == QUEUE ) {
+                Crnt_Q_It = 0 ;
+            }
+
+            Full[Crnt_Q_It].wait (Full [Crnt_Q_It].arrive () );
+
+
+            // Matmul
+            warpgroup_arrive();
+            // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
+                for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+
+                    bf16* CursA = sA + Crnt_Q_It * TILE_M*TILE_K + WGMMA_J * (TILE_K * WGMMA_M);
+                    bf16* CursB = sB + Crnt_Q_It * TILE_N*TILE_K + WGMMA_I * (TILE_K * WGMMA_N);
+
+                    #pragma unroll
+                    for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
+                        Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J], &CursA[LocalK], &CursB[LocalK]);
+                    }
+                }
+            // }
+            wgmma_commit();
+            wgmma_wait<0>();
+
+            barrier::arrival_token _ = Empty[Crnt_Q_It].arrive();
+        }
+
+        // Store 
+        // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
+            for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+                bf16* GlobalC = C + GlobalI*M + GlobalJ;
+                bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
+                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J], thIdx, WGMMA_C, M);
+            }
+        // }
     }
 
-    // Store 
-    for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
-        for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
-            bf16* GlobalC = C + GlobalI*M + GlobalJ;
-            bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
-            Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J], thIdx, WGMMA_C, M);
-        }
-    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
