@@ -103,8 +103,7 @@ constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
 
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
-    __shared__ alignas(8)  uint64_t A_barrier;
-    __shared__ alignas(8)  uint64_t B_barrier;
+    __shared__ alignas(8)  uint64_t Barrier;
 
     __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
     __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
@@ -115,52 +114,42 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
     int thIdx = threadIdx.x;
 
     if ( thIdx == 0 ) {
-        init_barrier (&A_barrier, NUM_THREADS);
-        init_barrier (&B_barrier, NUM_THREADS);
+        init_barrier (&Barrier, NUM_THREADS);
         async_proxy_fence ();
     }
     __syncthreads();
 
 
-    int A_cur_phase = 0;
-    int B_cur_phase = 0;
+    int Cur_phase = 0;
     for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K ) {
-        // load A    
         if ( thIdx == 0 ) {
             cp_async_bulk_tensor_2d_global_to_shared (
                 sA,
                 &A_map,
                 GlobalK,
                 GlobalJ,
-                &A_barrier
-            );
-            expect_bytes_and_arrive (
-                &A_barrier,
-                TILE_M*TILE_K*sizeof(bf16)
+                &Barrier
             );
 
-            // load B
             cp_async_bulk_tensor_2d_global_to_shared (
                 sB,
                 &B_map,
                 GlobalK,
                 GlobalI,
-                &B_barrier
+                &Barrier
             );
+
             expect_bytes_and_arrive (
-                &B_barrier,
-                TILE_N*TILE_K*sizeof(bf16)
+                &Barrier,
+                TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
             );
+
         } else {
-            arrive (&A_barrier, 1);
-            arrive (&B_barrier, 1);
+            arrive (&Barrier, 1);
         }
 
-        wait (&A_barrier, A_cur_phase);
-        wait (&B_barrier, B_cur_phase); 
-        __syncthreads();
-        A_cur_phase ^= 1 ;
-        B_cur_phase ^= 1 ;
+        wait (&Barrier, Cur_phase);
+        Cur_phase ^= 1 ;
 
         // Matmul
         warpgroup_arrive();
