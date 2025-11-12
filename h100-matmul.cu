@@ -98,7 +98,8 @@ constexpr int WGMMA_N= 128;
 constexpr int WGMMA_M= 64;
 constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128;
-
+constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
+constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
     __shared__ alignas(8)  uint64_t A_barrier;
@@ -106,7 +107,7 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
 
     __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
     __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
-    float rC [WGMMA_N/16][8] = {0.0f};
+    float rC [WGMMA_PER_N][WGMMA_PER_M][WGMMA_N/16][8] = {0.0f};
 
     int GlobalI = blockIdx.y * TILE_N;
     int GlobalJ = blockIdx.x * TILE_M;
@@ -164,14 +165,14 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
         warpgroup_arrive();
         #pragma unroll
         for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
-            Ref::wgmma_m64nNk16<WGMMA_N>(rC, &sA[LocalK], &sB[LocalK]);
+            Ref::wgmma_m64nNk16<WGMMA_N>(rC[0][0], &sA[LocalK], &sB[LocalK]);
         }
         wgmma_commit();
         wgmma_wait<0>();
     }
 
     // Store 
-    Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC, thIdx, C + GlobalI*M + GlobalJ, M);
+    Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[0][0], thIdx, C + GlobalI*M + GlobalJ, M);
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
