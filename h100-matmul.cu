@@ -89,7 +89,7 @@ void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint3
 
 
 // TUNABLE
-constexpr int TILE_M = 64;
+constexpr int TILE_M = 128;
 constexpr int TILE_N = 128;
 constexpr int TILE_K = 64;
 constexpr int WGMMA_N= 128;
@@ -100,6 +100,7 @@ constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128;
 constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
 constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
+
 __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
     
     __shared__ alignas(8)  uint64_t A_barrier;
@@ -163,16 +164,30 @@ __global__ void h100_matmul(int M, int N, int K, __grid_constant__ const CUtenso
 
         // Matmul
         warpgroup_arrive();
-        #pragma unroll
-        for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
-            Ref::wgmma_m64nNk16<WGMMA_N>(rC[0][0], &sA[LocalK], &sB[LocalK]);
+        for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
+            for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+
+                bf16* CursA = sA + WGMMA_J * (TILE_K * WGMMA_M);
+                bf16* CursB = sB + WGMMA_I * (TILE_K * WGMMA_N);
+
+                #pragma unroll
+                for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
+                    Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J], &CursA[LocalK], &CursB[LocalK]);
+                }
+            }
         }
         wgmma_commit();
         wgmma_wait<0>();
     }
 
     // Store 
-    Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[0][0], thIdx, C + GlobalI*M + GlobalJ, M);
+    for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
+        for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+            bf16* GlobalC = C + GlobalI*M + GlobalJ;
+            bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
+            Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J], thIdx, WGMMA_C, M);
+        }
+    }
 }
 
 void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
