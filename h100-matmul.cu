@@ -109,7 +109,7 @@ constexpr int TILE_M = 128;
 constexpr int TILE_N = 128;
 constexpr int TILE_K = 64;
 constexpr int WGMMA_N= 128;
-constexpr int QUEUE = 4;
+constexpr int QUEUE = 5;
 constexpr int WG = 2 ;
 
 // CONSTS
