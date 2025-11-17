@@ -234,6 +234,7 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
 
         // Store 
         // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
+            #pragma unroll
             for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
                 bf16* GlobalC = C + GlobalI*M + GlobalJ;
                 bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
