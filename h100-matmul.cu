@@ -59,15 +59,19 @@ __device__ inline void store_wgmma_m64nNk16 (float d[WGMMA_N/16][8], int tid, bf
     for (int w = 0; w < WGMMA_N/16; ++w) {
         int col = 16*w + 2*(tid & 3);
 
-        block_C[CIDX(row,     col    )] = __float2bfloat16(d[w][0]);
-        block_C[CIDX(row,     col + 1)] = __float2bfloat16(d[w][1]);
-        block_C[CIDX(row + 8, col    )] = __float2bfloat16(d[w][2]);
-        block_C[CIDX(row + 8, col + 1)] = __float2bfloat16(d[w][3]);
-
-        block_C[CIDX(row,     col + 8)] = __float2bfloat16(d[w][4]);
-        block_C[CIDX(row,     col + 9)] = __float2bfloat16(d[w][5]);
-        block_C[CIDX(row + 8, col + 8)] = __float2bfloat16(d[w][6]);
-        block_C[CIDX(row + 8, col + 9)] = __float2bfloat16(d[w][7]);
+        block_C[CIDX(row,     col    )] = (d[w][0]);
+        block_C[CIDX(row + 8, col    )] = (d[w][2]);
+        
+        
+        block_C[CIDX(row,     col + 1)] = (d[w][1]);
+        block_C[CIDX(row + 8, col + 1)] = (d[w][3]);
+        
+        
+        block_C[CIDX(row,     col + 8)] = (d[w][4]);
+        block_C[CIDX(row + 8, col + 8)] = (d[w][6]);
+        
+        block_C[CIDX(row,     col + 9)] = (d[w][5]);
+        block_C[CIDX(row + 8, col + 9)] = (d[w][7]);
     }
     #undef CIDX
 }
