@@ -106,11 +106,11 @@ void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint3
 
 // TUNABLE
 constexpr int TILE_M = 128;
-constexpr int TILE_N = 128;
+constexpr int TILE_N = 256;
 constexpr int TILE_K = 64;
-constexpr int WGMMA_N= 128;
-constexpr int QUEUE = 5;
-constexpr int WG = 2 ;
+constexpr int WGMMA_N= 256;
+constexpr int QUEUE = 3;
+constexpr int WG = 3 ;
 
 // CONSTS
 constexpr int WGMMA_M= 64;
@@ -118,6 +118,8 @@ constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128 * WG;
 constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
 constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
+constexpr int NUM_CONSUMERS = WG - 1;
+constexpr int WGMMA_PER_M_PER_CONSUMER = WGMMA_PER_M / NUM_CONSUMERS;
 
 constexpr int WGMMA_I = 0;
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -143,7 +145,8 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     __shared__ barrier Full  [QUEUE];
     __shared__ barrier Empty [QUEUE];
 
-    float rC [WGMMA_PER_N][WGMMA_PER_M][WGMMA_N/16][8] = {0.0f};
+    float rC[WGMMA_PER_N][WGMMA_PER_M_PER_CONSUMER][WGMMA_N/16][8] = {0.0f};
+
 
     int GlobalI = blockIdx.y * TILE_N;
     int GlobalJ = blockIdx.x * TILE_M;
@@ -151,18 +154,16 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     int wgIdx = threadIdx.x / 128;
 
     if ( thIdx == 0 ) {
-        // init_barrier (&Barrier, NUM_THREADS);
-        // init (&Barrier, NUM_THREADS);
         for (int i = 0 ; i < QUEUE ; i ++ ) {
-            init (&Full  [i], 128 + 1 );
-            init (&Empty [i], 128 + 1 );
+            init (&Full  [i], NUM_CONSUMERS * 128 + 1 );
+            init (&Empty [i], NUM_CONSUMERS * 128 + 1 );
         }
         async_proxy_fence ();
     }
     __syncthreads();
 
 
-    if ( wgIdx == 0 ) {
+    if ( wgIdx == WG-1 ) {
         
         if ( thIdx == 0 ) {
             int Crnt_Q_It = 0 ;
@@ -215,14 +216,14 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
             // Matmul
             warpgroup_arrive();
             // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
-                for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+                for ( int WGMMA_J = wgIdx ; WGMMA_J < WGMMA_PER_M_PER_CONSUMER + wgIdx; WGMMA_J ++ ) {
 
                     bf16* CursA = sA + Crnt_Q_It * TILE_M*TILE_K + WGMMA_J * (TILE_K * WGMMA_M);
                     bf16* CursB = sB + Crnt_Q_It * TILE_N*TILE_K + WGMMA_I * (TILE_K * WGMMA_N);
 
                     #pragma unroll
                     for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
-                        Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J], &CursA[LocalK], &CursB[LocalK]);
+                        Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J-wgIdx], &CursA[LocalK], &CursB[LocalK]);
                     }
                 }
             // }
@@ -235,10 +236,10 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
         // Store 
         // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
             #pragma unroll
-            for ( int WGMMA_J = 0 ; WGMMA_J < WGMMA_PER_M ; WGMMA_J ++ ) {
+            for ( int WGMMA_J = wgIdx ; WGMMA_J < WGMMA_PER_M_PER_CONSUMER + wgIdx; WGMMA_J ++ ) {
                 bf16* GlobalC = C + GlobalI*M + GlobalJ;
                 bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
-                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J], thIdx, WGMMA_C, M);
+                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J-wgIdx], thIdx, WGMMA_C, M);
             }
         // }
     }
