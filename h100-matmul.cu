@@ -84,7 +84,7 @@ __device__ inline void store_wgmma_m64nNk16 (float d[WGMMA_N/16][8], int tid, bf
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
 
-void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint32_t globalCols, uint32_t sharedRows, uint32_t sharedCols) {
+void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint32_t globalCols, uint32_t sharedRows, uint32_t sharedCols, int swizzle) {
     void* globalAddress = src;
     constexpr uint32_t tensorRank = 2;
     uint64_t globalDim[tensorRank] = {globalCols, globalRows};
@@ -101,7 +101,7 @@ void get_tensor_map (CUtensorMap* src_map, bf16* src, uint32_t globalRows, uint3
         boxDim,                   // const cuuint32_t *boxDim,
         elementStrides,                // const cuuint32_t *elementStrides,
         CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,
+        swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
         CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
         CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
     ));
@@ -130,9 +130,10 @@ constexpr int WGMMA_I = 0;
 struct SMem {
     alignas(128) bf16 A[TILE_M*TILE_K*QUEUE];
     alignas(128) bf16 B[TILE_N*TILE_K*QUEUE];
+    alignas(128) bf16 C[TILE_N*TILE_M];
 };
 
-__global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, bf16 *C) {
+__global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, __grid_constant__ const CUtensorMap C_map) {
     
     // __shared__ alignas(8)  uint64_t Barrier;
     
@@ -141,6 +142,7 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     SMem &s = *reinterpret_cast<SMem*>(smem);
     bf16 *sA = s.A;
     bf16 *sB = s.B;
+    bf16 *sC = s.C;
     // __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
     // __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
 
@@ -244,11 +246,22 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
         // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
             #pragma unroll
             for ( int WGMMA_J = wgIdx ; WGMMA_J < WGMMA_PER_M_PER_CONSUMER + wgIdx; WGMMA_J ++ ) {
-                bf16* GlobalC = C + GlobalI*M + GlobalJ;
-                bf16* WGMMA_C = GlobalC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
-                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J-wgIdx], thIdx, WGMMA_C, M);
+                // bf16* GlobalC = C + GlobalI*M + GlobalJ;
+                bf16* WGMMA_C = sC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
+                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J-wgIdx], thIdx, WGMMA_C, TILE_M);
             }
         // }
+        asm volatile("bar.sync 1, 256;\n");
+          if (threadIdx.x == 0 ) {
+            cp_async_bulk_tensor_2d_shared_to_global(
+                &C_map,
+                GlobalJ,
+                GlobalI,
+                sC
+            );
+            tma_commit_group();
+            tma_wait_until_pending<0>();
+        }
     }
 
 }
@@ -257,9 +270,11 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
     // <--- your code here --->
     CUtensorMap A_map{};
-    get_tensor_map (&A_map, A, M, K, TILE_M, TILE_K);
+    get_tensor_map (&A_map, A, M, K, TILE_M, TILE_K, 1);
     CUtensorMap B_map{};
-    get_tensor_map (&B_map, B, N, K, TILE_N, TILE_K);
+    get_tensor_map (&B_map, B, N, K, TILE_N, TILE_K, 1);
+    CUtensorMap C_map{};
+    get_tensor_map (&C_map, C, N, M, TILE_N, TILE_M, 0);
 
     dim3 block (NUM_THREADS, 1, 1) ;
     dim3 grid  ((M + TILE_M - 1 )/TILE_M,(N + TILE_N - 1 )/TILE_N, 1) ;
@@ -273,7 +288,7 @@ void launch_h100_matmul(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
         )
     );
 
-    h100_matmul <<<grid, block, smem_bytes>>>(M,N,K,A_map,B_map,C);
+    h100_matmul <<<grid, block, smem_bytes>>>(M,N,K,A_map,B_map,C_map);
 }
 
 /// <--- your code here --->
