@@ -122,8 +122,6 @@ constexpr int NUM_CONSUMERS = WG - 1;
 constexpr int WGMMA_PER_M_PER_CONSUMER = WGMMA_PER_M / NUM_CONSUMERS;
 
 constexpr int WGMMA_I = 0;
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cde = cuda::device::experimental;
 
 struct SMem {
     alignas(128) bf16 A[TILE_M*TILE_K*QUEUE];
@@ -142,8 +140,8 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     // __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
     // __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
 
-    __shared__ barrier Full  [QUEUE];
-    __shared__ barrier Empty [QUEUE];
+    __shared__ __align__(8) uint64_t Full  [QUEUE];
+    __shared__ __align__(8) uint64_t Empty [QUEUE];
 
     float rC[WGMMA_PER_N][WGMMA_PER_M_PER_CONSUMER][WGMMA_N/16][8] = {0.0f};
 
@@ -155,8 +153,8 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
 
     if ( thIdx == 0 ) {
         for (int i = 0 ; i < QUEUE ; i ++ ) {
-            init (&Full  [i], NUM_CONSUMERS * 128 + 1 );
-            init (&Empty [i], NUM_CONSUMERS * 128 + 1 );
+            init_barrier (&Full  [i], 1 );
+            init_barrier (&Empty [i], NUM_CONSUMERS );
         }
         async_proxy_fence ();
     }
@@ -167,30 +165,33 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
         
         if ( thIdx == 0 ) {
             int Crnt_Q_It = 0 ;
+            int Crnt_Phase = 0 ;
             for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
                 if (Crnt_Q_It == QUEUE) {
                     Crnt_Q_It = 0 ;
+                    Crnt_Phase ^= 1 ;
                 }
-                Empty [Crnt_Q_It] .wait ( Empty [Crnt_Q_It] .arrive() );
-                cde::cp_async_bulk_tensor_2d_global_to_shared (
+
+                wait(&Empty[Crnt_Q_It], Crnt_Phase);
+
+                cp_async_bulk_tensor_2d_global_to_shared (
                     &sA [ Crnt_Q_It * TILE_M*TILE_K],
                     &A_map,
                     GlobalK,
                     GlobalJ,
-                    Full [Crnt_Q_It]
+                    &Full[Crnt_Q_It]
                 );
 
-                cde::cp_async_bulk_tensor_2d_global_to_shared (
+                cp_async_bulk_tensor_2d_global_to_shared (
                     &sB [ Crnt_Q_It * TILE_N*TILE_K],
                     &B_map,
                     GlobalK,
                     GlobalI,
-                    Full [Crnt_Q_It]
+                    &Full[Crnt_Q_It]
                 );
 
-                barrier::arrival_token _ = cuda::device::barrier_arrive_tx (
-                    Full [Crnt_Q_It],
-                    1,
+                expect_bytes_and_arrive (
+                    &Full[Crnt_Q_It],
                     TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
                 );
 
@@ -201,16 +202,18 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     } else {
 
         for (int i = 0 ; i < QUEUE ; i ++ ) {
-            barrier::arrival_token _ = Empty [i] .arrive();
+            if ( thIdx == 0 ) arrive (&Empty[i],1);
         }
 
         int Crnt_Q_It = 0 ;
+        int Crnt_Phase = 0 ;
         for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
             if ( Crnt_Q_It == QUEUE ) {
                 Crnt_Q_It = 0 ;
+                Crnt_Phase ^= 1 ;
             }
 
-            Full[Crnt_Q_It].wait (Full [Crnt_Q_It].arrive () );
+            wait(&Full[Crnt_Q_It], Crnt_Phase);
 
 
             // Matmul
@@ -230,7 +233,7 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
             wgmma_commit();
             wgmma_wait<0>();
 
-            barrier::arrival_token _ = Empty[Crnt_Q_It].arrive();
+            if (thIdx == 0) arrive(&Empty[Crnt_Q_It], 1);
         }
 
         // Store 
