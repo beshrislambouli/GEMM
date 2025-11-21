@@ -70,9 +70,14 @@ constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128 * WG;
 constexpr int NUM_CONSUMERS = WG - 1;
 
+// CONSTS for opts
+constexpr int X_expect_bytes_and_arrive = TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16);
+constexpr int X_TILE_M_TILE_K = TILE_M*TILE_K;
+constexpr int X_TILE_N_TILE_K = TILE_N*TILE_K;
+constexpr int X_TILE_K_WGMMA_M= TILE_K * WGMMA_M;
 struct SMem {
-    alignas(128) bf16 A[TILE_M*TILE_K*QUEUE];
-    alignas(128) bf16 B[TILE_N*TILE_K*QUEUE];
+    alignas(128) bf16 A[X_TILE_M_TILE_K*QUEUE];
+    alignas(128) bf16 B[X_TILE_N_TILE_K*QUEUE];
     alignas(128) bf16 C[TILE_N*TILE_M];
 };
 
@@ -120,7 +125,7 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
                 wait(&ReadDone[QNXT], Crnt_Phase);
 
                 cp_async_bulk_tensor_2d_global_to_shared (
-                    &sA [ QNXT * TILE_M*TILE_K],
+                    &sA [ QNXT * X_TILE_M_TILE_K],
                     &A_map,
                     GlobalK,
                     GlobalJ,
@@ -128,16 +133,17 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
                 );
 
                 cp_async_bulk_tensor_2d_global_to_shared (
-                    &sB [ QNXT * TILE_N*TILE_K],
+                    &sB [ QNXT * X_TILE_N_TILE_K],
                     &B_map,
                     GlobalK,
                     GlobalI,
                     &WriteDone[QNXT]
                 );
 
+                
                 expect_bytes_and_arrive (
                     &WriteDone[QNXT],
-                    TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
+                    X_expect_bytes_and_arrive
                 );
 
             }
@@ -166,8 +172,8 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
             // Matmul
             warpgroup_arrive();
 
-            bf16* CursA = sA + QNXT * TILE_M*TILE_K + wgIdx * (TILE_K * WGMMA_M);
-            bf16* CursB = sB + QNXT * TILE_N*TILE_K ;
+            bf16* CursA = sA + QNXT * X_TILE_M_TILE_K + wgIdx * (X_TILE_K_WGMMA_M);
+            bf16* CursB = sB + QNXT * X_TILE_N_TILE_K ;
 
             #pragma unroll
             for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
