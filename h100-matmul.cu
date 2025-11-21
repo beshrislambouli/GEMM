@@ -28,58 +28,6 @@
 
 typedef __nv_bfloat16 bf16;
 
-// Ref
-namespace Ref {
-    // THIS CODE WAS TAKEN FROM https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
-    // WILL BE REPLACED BY MY OWN CODE AFTER ASKING ABOUT PTX INSTRUCTIONS IN OFFICE HOURS
-
-template<int WGMMA_N>
-__device__ inline void wgmma_m64nNk16(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
-    static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
-    if  constexpr (WGMMA_N == 256)
-        wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
-    if  constexpr (WGMMA_N == 192)
-        wgmma192<1, 1, 1, 0, 0>(d, sA, sB);
-    if  constexpr (WGMMA_N == 128)
-        wgmma128<1, 1, 1, 0, 0>(d, sA, sB);
-    if constexpr (WGMMA_N == 64)
-        wgmma64<1, 1, 1, 0, 0>(d, sA, sB);
-    if constexpr (WGMMA_N == 32)
-        wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
-}
-
-template<int WGMMA_N>
-__device__ inline void store_wgmma_m64nNk16 (float d[WGMMA_N/16][8], int tid, bf16* block_C, int M) {
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    uint32_t row = warp*16 + lane/4;
-
-    #define CIDX(i,j) (( (j) )*M + ( (i) ))
-    #pragma unroll
-    for (int w = 0; w < WGMMA_N/16; ++w) {
-        int col = 16*w + 2*(tid & 3);
-
-        block_C[CIDX(row,     col    )] = (d[w][0]);
-        block_C[CIDX(row + 8, col    )] = (d[w][2]);
-        
-        
-        block_C[CIDX(row,     col + 1)] = (d[w][1]);
-        block_C[CIDX(row + 8, col + 1)] = (d[w][3]);
-        
-        
-        block_C[CIDX(row,     col + 8)] = (d[w][4]);
-        block_C[CIDX(row + 8, col + 8)] = (d[w][6]);
-        
-        block_C[CIDX(row,     col + 9)] = (d[w][5]);
-        block_C[CIDX(row + 8, col + 9)] = (d[w][7]);
-    }
-    #undef CIDX
-}
-
-}
-
-
-
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Matrix Multiplication for M = 8192, N = 8192, K = 8192
 ////////////////////////////////////////////////////////////////////////////////
@@ -120,12 +68,7 @@ constexpr int WG = 3 ;
 constexpr int WGMMA_M= 64;
 constexpr int WGMMA_K= 16;
 constexpr int NUM_THREADS = 128 * WG;
-constexpr int WGMMA_PER_N = TILE_N / WGMMA_N ;
-constexpr int WGMMA_PER_M = TILE_M / WGMMA_M ;
 constexpr int NUM_CONSUMERS = WG - 1;
-constexpr int WGMMA_PER_M_PER_CONSUMER = WGMMA_PER_M / NUM_CONSUMERS;
-
-constexpr int WGMMA_I = 0;
 
 struct SMem {
     alignas(128) bf16 A[TILE_M*TILE_K*QUEUE];
@@ -134,33 +77,29 @@ struct SMem {
 };
 
 __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, __grid_constant__ const CUtensorMap A_map, __grid_constant__ const CUtensorMap B_map, __grid_constant__ const CUtensorMap C_map) {
-    
-    // __shared__ alignas(8)  uint64_t Barrier;
-    
 
     extern __shared__ __align__(128) uint8_t smem[];
     SMem &s = *reinterpret_cast<SMem*>(smem);
     bf16 *sA = s.A;
     bf16 *sB = s.B;
     bf16 *sC = s.C;
-    // __shared__ alignas(128) bf16  sA[TILE_M*TILE_K];
-    // __shared__ alignas(128) bf16  sB[TILE_N*TILE_K];
 
-    __shared__ __align__(8) uint64_t Full  [QUEUE];
-    __shared__ __align__(8) uint64_t Empty [QUEUE];
+    __shared__ __align__(8) uint64_t WriteDone  [QUEUE];
+    __shared__ __align__(8) uint64_t ReadDone [QUEUE];
 
-    float rC[WGMMA_PER_N][WGMMA_PER_M_PER_CONSUMER][WGMMA_N/16][8] = {0.0f};
+    float rC[WGMMA_N/16][8] = {0.0f};
 
-
-    int GlobalI = blockIdx.y * TILE_N;
-    int GlobalJ = blockIdx.x * TILE_M;
-    int thIdx = threadIdx.x % 128;
-    int wgIdx = threadIdx.x / 128;
+    const int GlobalI = blockIdx.y * TILE_N;
+    const int GlobalJ = blockIdx.x * TILE_M;
+    const int thIdx = threadIdx.x % 128;
+    const int wgIdx = threadIdx.x / 128;
+    const int lane = thIdx & 31;
+    const int warp = thIdx >> 5;
 
     if ( thIdx == 0 ) {
         for (int i = 0 ; i < QUEUE ; i ++ ) {
-            init_barrier (&Full  [i], 1 );
-            init_barrier (&Empty [i], NUM_CONSUMERS );
+            init_barrier (&WriteDone [i], 1 );
+            init_barrier (&ReadDone  [i], NUM_CONSUMERS );
         }
         async_proxy_fence ();
     }
@@ -170,34 +109,34 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
     if ( wgIdx == WG-1 ) {
         
         if ( thIdx == 0 ) {
-            int Crnt_Q_It = 0 ;
+            int QNXT = 0 ;
             int Crnt_Phase = 0 ;
-            for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
-                if (Crnt_Q_It == QUEUE) {
-                    Crnt_Q_It = 0 ;
+            for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , QNXT ++ ) {
+                if (QNXT == QUEUE) {
+                    QNXT = 0 ;
                     Crnt_Phase ^= 1 ;
                 }
 
-                wait(&Empty[Crnt_Q_It], Crnt_Phase);
+                wait(&ReadDone[QNXT], Crnt_Phase);
 
                 cp_async_bulk_tensor_2d_global_to_shared (
-                    &sA [ Crnt_Q_It * TILE_M*TILE_K],
+                    &sA [ QNXT * TILE_M*TILE_K],
                     &A_map,
                     GlobalK,
                     GlobalJ,
-                    &Full[Crnt_Q_It]
+                    &WriteDone[QNXT]
                 );
 
                 cp_async_bulk_tensor_2d_global_to_shared (
-                    &sB [ Crnt_Q_It * TILE_N*TILE_K],
+                    &sB [ QNXT * TILE_N*TILE_K],
                     &B_map,
                     GlobalK,
                     GlobalI,
-                    &Full[Crnt_Q_It]
+                    &WriteDone[QNXT]
                 );
 
                 expect_bytes_and_arrive (
-                    &Full[Crnt_Q_It],
+                    &WriteDone[QNXT],
                     TILE_M*TILE_K*sizeof(bf16) + TILE_N*TILE_K*sizeof(bf16)
                 );
 
@@ -207,50 +146,71 @@ __global__ __launch_bounds__(NUM_THREADS) void h100_matmul(int M, int N, int K, 
 
     } else {
 
-        for (int i = 0 ; i < QUEUE ; i ++ ) {
-            if ( thIdx == 0 ) arrive (&Empty[i],1);
+        if ( thIdx == 0 ) {
+            for (int i = 0 ; i < QUEUE ; i ++ ) {
+                arrive (&ReadDone[i],1);
+            }
         }
 
-        int Crnt_Q_It = 0 ;
+        int QNXT = 0 ;
         int Crnt_Phase = 0 ;
-        for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , Crnt_Q_It ++ ) {
-            if ( Crnt_Q_It == QUEUE ) {
-                Crnt_Q_It = 0 ;
+        for (int GlobalK = 0 ; GlobalK < K ; GlobalK += TILE_K , QNXT ++ ) {
+            if ( QNXT == QUEUE ) {
+                QNXT = 0 ;
                 Crnt_Phase ^= 1 ;
             }
 
-            wait(&Full[Crnt_Q_It], Crnt_Phase);
+            wait(&WriteDone[QNXT], Crnt_Phase);
 
 
             // Matmul
             warpgroup_arrive();
-            // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
-                for ( int WGMMA_J = wgIdx ; WGMMA_J < WGMMA_PER_M_PER_CONSUMER + wgIdx; WGMMA_J ++ ) {
 
-                    bf16* CursA = sA + Crnt_Q_It * TILE_M*TILE_K + WGMMA_J * (TILE_K * WGMMA_M);
-                    bf16* CursB = sB + Crnt_Q_It * TILE_N*TILE_K + WGMMA_I * (TILE_K * WGMMA_N);
+            bf16* CursA = sA + QNXT * TILE_M*TILE_K + wgIdx * (TILE_K * WGMMA_M);
+            bf16* CursB = sB + QNXT * TILE_N*TILE_K ;
 
-                    #pragma unroll
-                    for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
-                        Ref::wgmma_m64nNk16<WGMMA_N>(rC[WGMMA_I][WGMMA_J-wgIdx], &CursA[LocalK], &CursB[LocalK]);
-                    }
-                }
-            // }
+            #pragma unroll
+            for (int LocalK = 0 ; LocalK < TILE_K ; LocalK += WGMMA_K ) {
+                wgmma_n256<1,1,1,0,0>(
+                    make_smem_desc<SWIZZLE_128B>(&CursA[LocalK], 16, 1024),
+                    make_smem_desc<SWIZZLE_128B>(&CursB[LocalK], 16, 1024),
+                    rC
+                );
+            }
+
             wgmma_commit();
             wgmma_wait<0>();
 
-            if (thIdx == 0) arrive(&Empty[Crnt_Q_It], 1);
+            if (thIdx == 0) arrive(&ReadDone[QNXT], 1);
         }
 
         // Store 
-        // for (int WGMMA_I = 0 ; WGMMA_I < WGMMA_PER_N ; WGMMA_I ++ ) {
-            #pragma unroll
-            for ( int WGMMA_J = wgIdx ; WGMMA_J < WGMMA_PER_M_PER_CONSUMER + wgIdx; WGMMA_J ++ ) {
-                // bf16* GlobalC = C + GlobalI*M + GlobalJ;
-                bf16* WGMMA_C = sC + WGMMA_I * (M * WGMMA_N) + WGMMA_J * (WGMMA_M); 
-                Ref::store_wgmma_m64nNk16 <WGMMA_N> (rC[WGMMA_I][WGMMA_J-wgIdx], thIdx, WGMMA_C, TILE_M);
-            }
-        // }
+        const int row = warp*16 + lane/4;
+
+        bf16* WGMMA_C = sC + wgIdx * (WGMMA_M); 
+
+        #define IDX(i,j) (( (j) )*TILE_M + ( (i) ))
+        #pragma unroll
+        for (int w = 0; w < WGMMA_N/16; ++w) {
+            int col = 16*w + 2*(thIdx & 3);
+
+            WGMMA_C[IDX(row,     col    )] = (rC[w][0]);
+            WGMMA_C[IDX(row + 8, col    )] = (rC[w][2]);
+            
+            
+            WGMMA_C[IDX(row,     col + 1)] = (rC[w][1]);
+            WGMMA_C[IDX(row + 8, col + 1)] = (rC[w][3]);
+            
+            
+            WGMMA_C[IDX(row,     col + 8)] = (rC[w][4]);
+            WGMMA_C[IDX(row + 8, col + 8)] = (rC[w][6]);
+            
+            WGMMA_C[IDX(row,     col + 9)] = (rC[w][5]);
+            WGMMA_C[IDX(row + 8, col + 9)] = (rC[w][7]);
+        }
+        #undef IDX
+
+
         asm volatile("bar.sync 1, 256;\n");
           if (threadIdx.x == 0 ) {
             cp_async_bulk_tensor_2d_shared_to_global(
