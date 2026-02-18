@@ -18,17 +18,86 @@ typedef __nv_bfloat16 bf16;
 // Part 0: 64B Swizzle WGGMA load for M = 64, N = 8, K = 32
 ////////////////////////////////////////////////////////////////////////////////
 
+__device__ int f(int row, int col) {
+    int group = (row & 7) >> 1;
+    int block  = col >> 3;
+    int offset = col & 7;
+    int delta = (block & 1) ? -group : group;
+    int new_block = (block + delta) & 3;
+
+    return (new_block << 3) | offset;
+}
+
+template <int TILE_M, int TILE_K>
+__device__ void load_a(bf16* gmem, bf16* smem) {
+    for (int idx = threadIdx.y * blockDim.x + threadIdx.x; idx < TILE_M * TILE_K; idx += blockDim.x * blockDim.y) {
+        int row = idx / TILE_K;
+        int col = idx - row * TILE_K;
+        int swizzled_col = f(row, col);
+        int g_idx = row * TILE_K + col;
+        int s_idx = row * TILE_K + swizzled_col;
+
+        smem[s_idx] = gmem[g_idx];
+    }
+}
+
+template <int TILE_N, int TILE_K>
+__device__ void load_b(bf16* gmem, bf16* smem) {
+    for (int idx = threadIdx.y * blockDim.x + threadIdx.x; idx < TILE_N * TILE_K; idx += blockDim.x * blockDim.y) {
+        int row = idx / TILE_K;
+        int col = idx - row * TILE_K;
+        int swizzled_col = f(row, col);
+        int g_idx = row * TILE_K + col;
+        int s_idx = row * TILE_K + swizzled_col;
+
+        smem[s_idx] = gmem[g_idx];
+    }
+}
+
 template <int TILE_M, int TILE_N, int TILE_K>
 __global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
 
-    // <--- your code here --->
+    __shared__ bf16 sA[TILE_M * TILE_K];
+    __shared__ bf16 sB[TILE_N * TILE_K];
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
 
+    load_a<TILE_M, TILE_K>(a, sA);
+    load_b<TILE_N, TILE_K>(b, sB);
+
+    __syncthreads();
+    async_proxy_fence();
+
+    warpgroup_arrive();
+    wgmma_n8<0, 1, 1, 0, 0>(
+        make_smem_desc<SWIZZLE_64B>(sA, 1, 512),
+        make_smem_desc<SWIZZLE_64B>(sB, 1, 512),
+        d
+    );
+    wgmma_n8<1, 1, 1, 0, 0>(
+        make_smem_desc<SWIZZLE_64B>(sA + 16, 1, 512),
+        make_smem_desc<SWIZZLE_64B>(sB + 16, 1, 512),
+        d
+    );
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int row0 = (warp * 16) + (lane >> 2);
+    int row1 = row0 + 8;
+    int col0 = (lane & 3) << 1;
+    int col1 = col0 + 1;
+    c[row0 + TILE_M * col0] = d[0];
+    c[row0 + TILE_M * col1] = d[1];
+    c[row1 + TILE_M * col0] = d[2];
+    c[row1 + TILE_M * col1] = d[3];
 }
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
-
-    // <--- your code here --->
+    dim3 block(32, 4, 1);
+    dim3 grid(1, 1, 1);
+    swizzle_wgmma_m64n8k32<TILE_M, TILE_N, TILE_K><<<grid, block>>>(a, b, c);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
